@@ -316,7 +316,7 @@
       const errorEl = document.getElementById("error");
       const emptyStateEl = document.getElementById("empty-state");
 
-      function appendMessage(role, text, sources) {
+      function appendMessage(role, text, sources, isStreaming = false) {
         if (emptyStateEl) {
           emptyStateEl.style.display = "none";
         }
@@ -326,9 +326,16 @@
 
         const bubble = document.createElement("div");
         bubble.className = `bubble ${role}`;
-        bubble.textContent = text;
+        
+        if (isStreaming) {
+          // For streaming, we'll update the text content
+          bubble.textContent = text;
+          row.dataset.streaming = "true";
+        } else {
+          bubble.textContent = text;
+        }
 
-        if (role === "bot" && sources && sources.length) {
+        if (role === "bot" && sources && sources.length && !isStreaming) {
           const srcEl = document.createElement("div");
           srcEl.className = "sources";
           srcEl.textContent = "Sources: ";
@@ -343,6 +350,8 @@
         row.appendChild(bubble);
         messagesEl.appendChild(row);
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        
+        return bubble; // Return bubble for streaming updates
       }
 
       function setLoading(loading) {
@@ -360,20 +369,91 @@
         setLoading(true);
 
         try {
-          const resp = await fetch("/api/chat", {
+          // Use streaming endpoint
+          console.log("Sending request to /api/chat/stream");
+          const resp = await fetch("/api/chat/stream", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
             },
             body: JSON.stringify({ question }),
           });
+          
+          console.log("Response received, status:", resp.status);
 
           if (!resp.ok) {
             throw new Error(`HTTP ${resp.status}`);
           }
 
-          const data = await resp.json();
-          appendMessage("bot", data.answer || "(no answer)", data.sources || []);
+          // Handle streaming response
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let answerText = "";
+          let sources = [];
+          let bubble = null;
+          let messageRow = null;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || ""; // Keep incomplete line in buffer
+
+            for (const line of lines) {
+              if (line.trim() === "") continue; // Skip empty lines
+              
+              if (line.startsWith("data: ")) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  
+                  if (data.type === "token") {
+                    answerText += data.content;
+                    if (!bubble) {
+                      console.log("First token received, creating bubble");
+                      // Create message bubble on first token
+                      if (emptyStateEl) {
+                        emptyStateEl.style.display = "none";
+                      }
+                      messageRow = document.createElement("div");
+                      messageRow.className = "message-row bot";
+                      bubble = document.createElement("div");
+                      bubble.className = "bubble bot";
+                      messageRow.appendChild(bubble);
+                      messagesEl.appendChild(messageRow);
+                    }
+                    // Update text content immediately
+                    bubble.textContent = answerText;
+                    // Force reflow and scroll
+                    void bubble.offsetHeight; // Force reflow
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                  } else if (data.type === "sources") {
+                    sources = data.sources || [];
+                  } else if (data.type === "done") {
+                    // Add sources to the message
+                    if (bubble && sources.length > 0) {
+                      const srcEl = document.createElement("div");
+                      srcEl.className = "sources";
+                      srcEl.textContent = "Sources: ";
+                      sources.forEach((s) => {
+                        const tag = document.createElement("span");
+                        tag.textContent = s;
+                        srcEl.appendChild(tag);
+                      });
+                      bubble.appendChild(srcEl);
+                      messagesEl.scrollTop = messagesEl.scrollHeight;
+                    }
+                  } else if (data.type === "error") {
+                    throw new Error(data.message || "Unknown error");
+                  }
+                } catch (e) {
+                  console.error("Error parsing SSE data:", e, "Line:", line);
+                }
+              }
+            }
+          }
         } catch (err) {
           console.error(err);
           errorEl.textContent = "Failed to reach backend. Is web_chat.server running?";

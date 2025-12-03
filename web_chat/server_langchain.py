@@ -13,13 +13,15 @@ Run:
 """
 
 import sys
+import json
+import asyncio
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, AsyncGenerator
 from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -91,9 +93,55 @@ async def index() -> FileResponse:
     return FileResponse(str(html_path))
 
 
+async def stream_chat_response(rag: rag_langchain.LangChainRAG, question: str) -> AsyncGenerator[str, None]:
+    """Stream the chat response from RAG system."""
+    try:
+        # Use the streaming query method
+        if hasattr(rag, 'query_stream'):
+            sources = []
+            
+            async for chunk in rag.query_stream(question):
+                chunk_type = chunk.get("type")
+                
+                if chunk_type == "token":
+                    token = chunk.get("content", "")
+                    # Send token immediately
+                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                elif chunk_type == "sources":
+                    sources = chunk.get("sources", [])
+                elif chunk_type == "done":
+                    # Send sources and done signal
+                    if sources:
+                        yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                elif chunk_type == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'message': chunk.get('message', 'Unknown error')})}\n\n"
+        else:
+            # Fallback: simulate streaming by chunking the response
+            result = rag.query(question)
+            answer = result.get("answer", "I couldn't generate an answer.")
+            sources = result.get("sources", [])
+            
+            # Stream the answer character by character for smooth effect
+            for char in answer:
+                await asyncio.sleep(0.01)  # Small delay for streaming effect
+                yield f"data: {json.dumps({'type': 'token', 'content': char})}\n\n"
+            
+            if sources:
+                yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"❌ Error in stream_chat_response: {error_msg}")
+        traceback.print_exc()
+        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    """Web API endpoint using LangChain RAG with conversation memory."""
+    """Web API endpoint using LangChain RAG with conversation memory (non-streaming)."""
     question = request.question.strip()
     if not question:
         return ChatResponse(
@@ -114,6 +162,29 @@ async def chat(request: ChatRequest) -> ChatResponse:
         sources=result.get("sources", []),
         conversation_id=rag.conversation_id,
         chat_history_length=len(result.get("chat_history", []))
+    )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """Streaming endpoint for chat responses."""
+    question = request.question.strip()
+    if not question:
+        async def error_stream():
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Please enter a non-empty question.'})}\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    
+    # Get or create RAG instance for this conversation
+    rag = get_or_create_rag(request.conversation_id)
+    
+    return StreamingResponse(
+        stream_chat_response(rag, question),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable buffering in nginx
+        }
     )
 
 

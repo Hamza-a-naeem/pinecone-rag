@@ -464,6 +464,44 @@ Answer based on the context and conversation history:"""
                 "chat_history": []
             }
     
+    async def query_stream(self, question: str):
+        """
+        Stream query responses from the RAG system.
+        
+        Yields:
+            Dictionary with 'type' ('token', 'sources', 'done') and content
+        """
+        if not self.chain:
+            raise RuntimeError("RAG system not initialized. Call initialize() first.")
+        
+        import asyncio
+        
+        try:
+            # First, get the full answer (we'll stream it word by word)
+            # This ensures we have the complete answer and can stream it smoothly
+            result = self.query(question)
+            answer = result.get("answer", "I couldn't generate an answer.")
+            sources = result.get("sources", [])
+            
+            # Stream answer word by word for better UX (faster than character-by-character)
+            words = answer.split()
+            for i, word in enumerate(words):
+                # Add space after word (except last word)
+                content = word + (" " if i < len(words) - 1 else "")
+                yield {"type": "token", "content": content}
+                await asyncio.sleep(0.03)  # Small delay between words (30ms)
+            
+            # Send sources
+            yield {"type": "sources", "sources": sources}
+            yield {"type": "done"}
+        
+        except Exception as e:
+            import traceback
+            error_msg = str(e)
+            print(f"❌ Error in query_stream: {error_msg}")
+            traceback.print_exc()
+            yield {"type": "error", "message": error_msg}
+    
     def clear_memory(self):
         """Clear conversation memory."""
         if self.memory:
